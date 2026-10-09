@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MiniSFTP Web</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">MS</span> MiniSFTP Web</div>
+  <div class="connection-group">
+    <select id="serverSelect" aria-label="Server"></select>
+    <button id="connectBtn" class="btn">Connect</button>
+    <button id="disconnectBtn" class="btn">Disconnect</button>
+    <span id="connectionStatus" class="status offline">Offline</span>
+  </div>
+  <div class="topbar-actions">
+    <button id="newProfileBtn" class="btn">New Connection</button>
+    <button id="refreshHostsBtn" class="btn">Refresh</button>
+    <button id="themeBtn" class="btn">Theme</button>
+  </div>
+</header>
+
+<main class="workspace">
+  <section class="pane" id="localPane" data-pane="local">
+    <header class="pane-header">
+      <div class="pane-title">LOCAL</div>
+      <div class="pane-stats"><span id="localStats">0 files, 0 folders</span></div>
+    </header>
+    <div class="pane-toolbar">
+      <button class="icon-btn" id="localUp" title="Up">↑</button>
+      <button class="icon-btn" id="localRefresh" title="Refresh">⟳</button>
+      <button class="icon-btn" id="localMkdir" title="New folder">＋</button>
+      <input id="localPath" class="path-input" spellcheck="false">
+      <button class="icon-btn" id="localHidden" title="Show hidden files">#</button>
+      <button class="icon-btn" id="localGo" title="Go">→</button>
+    </div>
+    <nav id="localBreadcrumb" class="breadcrumbs"></nav>
+    <div class="table-wrap" id="localDrop">
+      <table class="file-table">
+        <thead>
+          <tr><th data-sort="name">Name</th><th data-sort="size">Size</th><th data-sort="time">Modified</th><th>Type</th></tr>
+        </thead>
+        <tbody id="localBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <aside class="transfer-actions">
+    <button id="uploadBtn" class="direction-btn">Upload →</button>
+    <button id="downloadBtn" class="direction-btn">← Download</button>
+    <select id="conflictStrategy" title="Conflict strategy">
+      <option value="ask">Ask</option>
+      <option value="skip">Skip</option>
+      <option value="overwrite">Overwrite</option>
+      <option value="rename">Rename</option>
+      <option value="resume">Resume</option>
+    </select>
+  </aside>
+
+  <section class="pane" id="remotePane" data-pane="remote">
+    <header class="pane-header">
+      <div class="pane-title">REMOTE</div>
+      <div class="pane-stats"><span id="remoteStats">0 files, 0 folders</span></div>
+    </header>
+    <div class="pane-toolbar">
+      <button class="icon-btn" id="remoteUp" title="Up">↑</button>
+      <button class="icon-btn" id="remoteRefresh" title="Refresh">⟳</button>
+      <button class="icon-btn" id="remoteMkdir" title="New folder">＋</button>
+      <input id="remotePath" class="path-input" spellcheck="false" disabled placeholder="Connect to a server">
+      <button class="icon-btn" id="remoteHidden" title="Show hidden files">#</button>
+      <button class="icon-btn" id="remoteGo" title="Go">→</button>
+    </div>
+    <nav id="remoteBreadcrumb" class="breadcrumbs"></nav>
+    <div class="table-wrap" id="remoteDrop">
+      <table class="file-table">
+        <thead>
+          <tr><th data-sort="name">Name</th><th data-sort="size">Size</th><th data-sort="time">Modified</th><th>Type</th></tr>
+        </thead>
+        <tbody id="remoteBody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<section class="transfer-panel">
+  <header class="panel-header">
+    <button id="toggleTransfers" class="panel-toggle">Transfers ▲</button>
+    <nav class="tabs">
+      <button class="tab active" data-tab="all">All</button>
+      <button class="tab" data-tab="active">Active</button>
+      <button class="tab" data-tab="queued">Queued</button>
+      <button class="tab" data-tab="completed">Completed</button>
+      <button class="tab" data-tab="failed">Failed</button>
+    </nav>
+    <button id="clearFinished" class="btn small">Clear finished</button>
+  </header>
+  <div id="transferList" class="transfer-list"></div>
+</section>
+
+<div id="toast" class="toast"></div>
+<div id="modalBackdrop" class="modal-backdrop hidden">
+  <div id="modal" class="modal" role="dialog" aria-modal="true"></div>
+</div>
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
