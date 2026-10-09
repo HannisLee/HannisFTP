@@ -17,3 +17,21 @@ def test_ssh_config_alias_discovery(tmp_path: Path):
     assert aliases["prod"].user == "alice"
     assert aliases["prod"].port == 2222
     assert aliases["prod"].identity_file.endswith("prod_key")
+
+
+def test_tabs_equals_multiple_aliases_includes_and_first_value(tmp_path):
+    from app.services.profile_manager import ProfileManager
+    config = tmp_path / "config"
+    included = tmp_path / "hosts.conf"
+    included.write_text("Host\tfirst second\n\tHostName= example.com # comment\n\tPort 2222\n", encoding="utf-8")
+    config.write_text('Include "hosts.conf"\nHost first\n HostName ignored.example\nHost *\n User common\n', encoding="utf-8")
+    aliases = {host.alias: host for host in ProfileManager(str(config)).discover_ssh_hosts()}
+    assert set(aliases) == {"first", "second"}
+    assert all(host.host == "example.com" and host.port == 2222 and host.user == "common" for host in aliases.values())
+
+
+def test_include_cycle_and_negated_alias_are_safe(tmp_path):
+    from app.services.profile_manager import ProfileManager
+    config = tmp_path / "config"
+    config.write_text('Include config\nHost prod !excluded *\n User alice\n', encoding="utf-8")
+    assert [host.alias for host in ProfileManager(str(config)).discover_ssh_hosts()] == ["prod"]

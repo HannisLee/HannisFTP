@@ -1,4 +1,3 @@
-import pytest
 
 from app.models import ProfileCreate, ProfileUpdate
 from app.storage import Storage

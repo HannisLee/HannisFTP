@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import secrets
-from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, WebSocket
 
@@ -40,20 +39,21 @@ class LocalWebSecurity:
         if modification:
             self.check_token(request)
 
-    async def check_websocket(self, websocket: WebSocket) -> None:
+    async def check_websocket(self, websocket: WebSocket) -> bool:
         host = (websocket.headers.get("host") or "").lower()
         hostname = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0].lstrip("[")
         if hostname not in {"127.0.0.1", "localhost", "::1"}:
-            await websocket.close(code=421)
+            await websocket.close(code=1008)
             return False
         origin = websocket.headers.get("origin")
         if origin:
-            parsed = urlsplit(origin)
-            if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-                await websocket.close(code=403)
+            scheme = "https" if websocket.url.scheme == "wss" else "http"
+            expected = f"{scheme}://{websocket.headers.get('host', '')}"
+            if not secrets.compare_digest(origin, expected):
+                await websocket.close(code=1008)
                 return False
         supplied = websocket.query_params.get("token")
         if not supplied or not secrets.compare_digest(supplied, self.token):
-            await websocket.close(code=401)
+            await websocket.close(code=1008)
             return False
         return True

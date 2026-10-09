@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Any
+import pytest
 
 from app.models import TransferOut, utc_now
 from app.services.progress_manager import ProgressManager
@@ -94,7 +93,6 @@ async def test_pause_resume_and_size_verification(settings, temp_root):
     assert mutable.model.resume_metadata["offset"] < len(payload)
 
     mutable.control.pause.clear()
-    mutable.model.conflict_strategy = "resume"
     result = await worker.run(mutable)
     assert result.status == "completed", result.error_message
     assert target.read_bytes() == payload
@@ -125,3 +123,63 @@ async def test_conflict_strategy_ask_and_rename(settings, temp_root):
     assert renamed.status == "completed"
     assert target.read_text() == "old data"
     assert (temp_root / "target" / "conflict (1).txt").read_text() == "new data"
+
+
+async def test_failed_atomic_replace_keeps_original(settings, temp_root):
+    source = temp_root / "source" / "file.bin"
+    source.write_bytes(b"new")
+    target = temp_root / "target" / source.name
+    target.write_bytes(b"original")
+
+    class FailedReplace(LocalTransferIO):
+        async def replace(self, source, target):
+            raise ConnectionError("Connection lost during commit")
+
+    model = TransferOut(
+        task_id="safe-overwrite", profile_id="p", direction="upload",
+        source_path=str(source.parent), destination_path=str(target.parent),
+        total_bytes=3, transferred_bytes=0, status="queued", created_at=utc_now(), conflict_strategy="overwrite",
+    )
+    worker = TransferWorker(settings, ProgressManager(), LocalTransferIO(temp_root), FailedReplace(temp_root), noop_persist)
+    result = await worker.run(MutableTask.from_model(model, [TransferEntry(source.name, False, 3, source.stat().st_mtime)]))
+    assert result.status == "failed"
+    assert target.read_bytes() == b"original"
+    assert (target.parent / ".safe-overwrite.0.part").read_bytes() == b"new"
+
+
+async def test_unique_local_name_is_stable(temp_root):
+    io = LocalTransferIO(temp_root)
+    path = temp_root / "file.txt"
+    path.write_bytes(b"existing")
+    (temp_root / "file (1).txt").write_bytes(b"existing")
+    assert await io.unique_path(str(path)) == str(temp_root / "file (2).txt")
+
+
+async def test_transfer_io_rejects_path_escape(temp_root):
+    io = LocalTransferIO(temp_root)
+    with pytest.raises(ValueError):
+        await io.open_write(str(temp_root / ".." / "escape.bin"), resume=False)
+
+
+async def test_source_change_during_transfer_keeps_original(settings, temp_root):
+    source = temp_root / "source" / "changing.bin"
+    source.write_bytes(os.urandom(200001))
+    initial = source.stat()
+    target = temp_root / "target" / source.name
+    target.write_bytes(b"original")
+
+    class ChangingWorker(TransferWorker):
+        async def _write_chunk(self, handle, offset, data):
+            await super()._write_chunk(handle, offset, data)
+            os.utime(source, (initial.st_atime, initial.st_mtime + 1))
+
+    model = TransferOut(
+        task_id="changing-source", profile_id="p", direction="upload",
+        source_path=str(source.parent), destination_path=str(target.parent),
+        total_bytes=initial.st_size, transferred_bytes=0, status="queued", created_at=utc_now(), conflict_strategy="overwrite",
+    )
+    worker = ChangingWorker(settings, ProgressManager(), LocalTransferIO(temp_root), LocalTransferIO(temp_root), noop_persist)
+    result = await worker.run(MutableTask.from_model(model, [TransferEntry(source.name, False, initial.st_size, initial.st_mtime)]))
+    assert result.status == "failed"
+    assert "Source changed during" in result.error_message
+    assert target.read_bytes() == b"original"

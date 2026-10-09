@@ -1,40 +1,48 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniSFTP Web</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v=20261009-tab-drag2">
 </head>
 <body>
 <header class="topbar">
   <div class="brand"><span class="brand-mark">MS</span> MiniSFTP Web</div>
-  <div class="connection-group">
-    <select id="serverSelect" aria-label="Server"></select>
-    <button id="connectBtn" class="btn">Connect</button>
-    <button id="disconnectBtn" class="btn">Disconnect</button>
-    <span id="connectionStatus" class="status offline">Offline</span>
+  <div class="topbar-actions">
+    <label class="add-target">添加到 <select id="targetPaneSelect" aria-label="添加标签的位置"><option value="local">左侧</option><option value="remote" selected>右侧</option></select></label>
+    <button id="connectBtn" class="btn">＋ 添加远程</button>
+    <button id="addLocalBtn" class="btn">＋ 添加本机</button>
+    <button id="manageConnectionsBtn" class="btn">管理连接</button>
   </div>
   <div class="topbar-actions">
-    <button id="newProfileBtn" class="btn">New Connection</button>
-    <button id="refreshHostsBtn" class="btn">Refresh</button>
-    <button id="themeBtn" class="btn">Theme</button>
+    <button id="newProfileBtn" class="btn">新建配置</button>
+    <button id="refreshHostsBtn" class="btn">刷新连接列表</button>
+    <button id="themeBtn" class="btn">主题</button>
   </div>
 </header>
+<div class="workspace-status" aria-live="polite">
+  <span id="leftEndpoint" class="endpoint-status">左侧 · 本机</span><span class="endpoint-separator">⇄</span><span id="rightEndpoint" class="endpoint-status">右侧 · 未选择</span>
+  <span id="connectionStatus" class="status offline">0 个连接</span><span id="taskStatus" class="task-status">无活动传输</span>
+  <span class="tab-drag-hint">拖动标签到另一侧，或拖动文件进行传输</span>
+</div>
+<select id="serverSelect" hidden aria-hidden="true" tabindex="-1"></select>
 
 <main class="workspace">
   <section class="pane" id="localPane" data-pane="local">
+    <div class="pane-tabbar"><div id="localTabs" class="pane-tabs" role="tablist" aria-label="左侧标签"></div><button id="localAddTab" class="icon-btn add-tab" aria-label="添加左侧标签">＋</button></div>
     <header class="pane-header">
-      <div class="pane-title">LOCAL</div>
+      <div class="pane-title" id="localTitle">LOCAL</div>
       <div class="pane-stats"><span id="localStats">0 files, 0 folders</span></div>
     </header>
     <div class="pane-toolbar">
-      <button class="icon-btn" id="localUp" title="Up">↑</button>
+      <button class="icon-btn parent-btn" id="localUp" title="返回上一层">返回上一层</button>
       <button class="icon-btn" id="localRefresh" title="Refresh">⟳</button>
-      <button class="icon-btn" id="localMkdir" title="New folder">＋</button>
-      <input id="localPath" class="path-input" spellcheck="false">
+      <div class="path-navigation">
+        <input id="localPath" class="path-input" spellcheck="false" aria-label="左侧文件夹路径">
+        <button class="icon-btn go-btn" id="localGo" title="进入输入的文件夹">GO</button>
+      </div>
       <button class="icon-btn" id="localHidden" title="Show hidden files">#</button>
-      <button class="icon-btn" id="localGo" title="Go">→</button>
     </div>
     <nav id="localBreadcrumb" class="breadcrumbs"></nav>
     <div class="table-wrap" id="localDrop">
@@ -48,29 +56,32 @@
   </section>
 
   <aside class="transfer-actions">
-    <button id="uploadBtn" class="direction-btn">Upload →</button>
-    <button id="downloadBtn" class="direction-btn">← Download</button>
+    <div id="routeStatus" class="route-status" aria-live="polite"><strong>传输连接</strong><span id="routeForward">选择两侧标签</span><span id="routeReverse"></span><button id="routeRefresh" class="btn small">重新检测</button></div>
+    <button id="uploadBtn" class="direction-btn">向右传输 →</button>
+    <button id="downloadBtn" class="direction-btn">← 向左传输</button>
     <select id="conflictStrategy" title="Conflict strategy">
-      <option value="ask">Ask</option>
-      <option value="skip">Skip</option>
-      <option value="overwrite">Overwrite</option>
-      <option value="rename">Rename</option>
-      <option value="resume">Resume</option>
+      <option value="ask">冲突时提示</option>
+      <option value="skip">跳过</option>
+      <option value="overwrite">覆盖</option>
+      <option value="rename">重命名</option>
+      <option value="resume">续传</option>
     </select>
   </aside>
 
   <section class="pane" id="remotePane" data-pane="remote">
+    <div class="pane-tabbar"><div id="remoteTabs" class="pane-tabs" role="tablist" aria-label="右侧标签"></div><button id="remoteAddTab" class="icon-btn add-tab" aria-label="添加右侧标签">＋</button></div>
     <header class="pane-header">
-      <div class="pane-title">REMOTE</div>
+      <div class="pane-title" id="remoteTitle">REMOTE</div>
       <div class="pane-stats"><span id="remoteStats">0 files, 0 folders</span></div>
     </header>
     <div class="pane-toolbar">
-      <button class="icon-btn" id="remoteUp" title="Up">↑</button>
+      <button class="icon-btn parent-btn" id="remoteUp" title="返回上一层">返回上一层</button>
       <button class="icon-btn" id="remoteRefresh" title="Refresh">⟳</button>
-      <button class="icon-btn" id="remoteMkdir" title="New folder">＋</button>
-      <input id="remotePath" class="path-input" spellcheck="false" disabled placeholder="Connect to a server">
+      <div class="path-navigation">
+        <input id="remotePath" class="path-input" spellcheck="false" aria-label="右侧文件夹路径" disabled placeholder="添加远程服务器或本机标签">
+        <button class="icon-btn go-btn" id="remoteGo" title="进入输入的文件夹">GO</button>
+      </div>
       <button class="icon-btn" id="remoteHidden" title="Show hidden files">#</button>
-      <button class="icon-btn" id="remoteGo" title="Go">→</button>
     </div>
     <nav id="remoteBreadcrumb" class="breadcrumbs"></nav>
     <div class="table-wrap" id="remoteDrop">
@@ -103,6 +114,6 @@
 <div id="modalBackdrop" class="modal-backdrop hidden">
   <div id="modal" class="modal" role="dialog" aria-modal="true"></div>
 </div>
-<script type="module" src="/static/js/app.js"></script>
+<script type="module" src="/static/js/app.js?v=20261009-tab-drag2"></script>
 </body>
 </html>

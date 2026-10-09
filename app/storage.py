@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import aiosqlite
 
@@ -118,6 +117,8 @@ class Storage:
         values = data.model_dump(exclude_unset=True)
         if not values:
             return current
+        # Validate the combined profile before persisting partial updates.
+        ProfileOut.model_validate({**current.model_dump(), **values})
         values["updated_at"] = utc_now().isoformat()
         assignments = ", ".join(f"{key} = ?" for key in values)
         await self.db.execute(

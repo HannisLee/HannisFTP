@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fnmatch
+import glob
 import re
+import shlex
 from pathlib import Path
-from typing import Iterable
 
 from app.models import SSHHost
 
@@ -12,52 +14,60 @@ class ProfileManager:
         self.ssh_config_path = Path(ssh_config_path).expanduser()
 
     def discover_ssh_hosts(self) -> list[SSHHost]:
-        if not self.ssh_config_path.exists():
-            return []
-        hosts: dict[str, SSHHost] = {}
-        self._parse_file(self.ssh_config_path, hosts, depth=0)
-        aliases = []
-        for alias, host in hosts.items():
-            if not any(char in alias for char in "*?!") and alias != "*":
-                aliases.append(host)
-        return sorted(aliases, key=lambda item: item.alias)
+        lines = list(self._read(self.ssh_config_path, set()))
+        aliases = {
+            alias for key, values in lines if key == "host" for alias in values
+            if not any(char in alias for char in "*?!")
+        }
+        result = []
+        for alias in sorted(aliases):
+            values: dict[str, str] = {}
+            matching = True
+            for key, args in lines:
+                if key == "host":
+                    positive = [p for p in args if not p.startswith("!")]
+                    negative = [p[1:] for p in args if p.startswith("!")]
+                    matching = any(fnmatch.fnmatchcase(alias.lower(), p.lower()) for p in positive) and not any(
+                        fnmatch.fnmatchcase(alias.lower(), p.lower()) for p in negative
+                    )
+                elif key == "match":
+                    # Discovery never executes Match exec. AsyncSSH evaluates
+                    # the full configuration when the user connects.
+                    matching = False
+                elif matching and args:
+                    values.setdefault(key, args[0])
+            port = values.get("port")
+            result.append(SSHHost(
+                alias=alias, host=values.get("hostname"), user=values.get("user"),
+                port=int(port) if port and port.isdigit() else None,
+                identity_file=str(Path(values["identityfile"]).expanduser()) if "identityfile" in values else None,
+                source=str(self.ssh_config_path),
+            ))
+        return result
 
-    def _parse_file(self, path: Path, hosts: dict[str, SSHHost], depth: int) -> None:
-        if depth > 5 or not path.exists():
+    def _read(self, path: Path, stack: set[Path]):
+        path = path.resolve()
+        if path in stack or len(stack) >= 16 or not path.is_file():
             return
-        current: SSHHost | None = None
-        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            key, _, value = line.partition(" ")
-            value = value.strip().strip('"')
-            key = key.lower()
-            if key == "host":
-                current = None
-                for alias in value.split():
-                    if alias.startswith("-") or "*" in alias or "?" in alias:
-                        continue
-                    current = SSHHost(alias=alias)
-                    hosts[alias] = current
-            elif key == "include" and current is None:
-                for pattern in value.split():
-                    if not pattern:
-                        continue
-                    include = Path(pattern).expanduser()
-                    if not include.is_absolute():
-                        include = path.parent / include
-                    for item in sorted(include.parent.glob(include.name)) if any(char in include.name for char in "*?") else [include]:
-                        self._parse_file(item, hosts, depth + 1)
-            elif current is not None:
-                if key == "hostname":
-                    current.host = value
-                elif key == "user":
-                    current.user = value
-                elif key == "port":
-                    try:
-                        current.port = int(value)
-                    except ValueError:
-                        pass
-                elif key == "identityfile":
-                    current.identity_file = str(Path(value).expanduser())
+        stack.add(path)
+        try:
+            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                match = re.match(r"^\s*([^\s=]+)\s*(?:=\s*)?(.*)$", raw)
+                if not match or match[1].startswith("#"):
+                    continue
+                try:
+                    args = shlex.split(match[2], comments=True)
+                except ValueError:
+                    continue
+                key = match[1].lower()
+                if key == "include":
+                    for pattern in args:
+                        include = Path(pattern).expanduser()
+                        if not include.is_absolute():
+                            include = self.ssh_config_path.parent / include
+                        for filename in sorted(glob.glob(str(include))):
+                            yield from self._read(Path(filename), stack)
+                else:
+                    yield key, args
+        finally:
+            stack.remove(path)

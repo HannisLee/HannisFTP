@@ -7,29 +7,41 @@ from pathlib import Path
 
 from app.models import FileEntry, FileListResponse
 from app.core.config import Settings
+from app.services.path_safety import local_path, validate_name
 
 
 class PathOutsideRootError(ValueError):
     pass
 
 
+DRIVES_PATH = "drives://"
+
+
 class LocalFileService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.root = settings.resolved_local_root
+        self.drives_path = DRIVES_PATH if os.name == "nt" and not settings.local_root else None
+
+    @property
+    def allowed_roots(self) -> tuple[Path, ...]:
+        return self.settings.allowed_local_roots
 
     def validate(self, path: str | Path) -> Path:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.root / candidate
+        if str(path) == DRIVES_PATH:
+            raise ValueError("Select a drive or folder first")
         try:
-            resolved = candidate.resolve(strict=False)
-            resolved.relative_to(self.root)
+            return local_path(self.allowed_roots, path, base=self.root)
         except (ValueError, RuntimeError) as exc:
-            raise PathOutsideRootError(f"Path is outside the allowed local root: {self.root}") from exc
-        return resolved
+            raise PathOutsideRootError(str(exc)) from exc
 
     async def list_dir(self, path: str, show_hidden: bool = False, sort: str = "name") -> FileListResponse:
+        if path == self.drives_path:
+            return FileListResponse(
+                path=DRIVES_PATH, parent=None,
+                entries=[FileEntry(name=drive.drive, path=str(drive), is_dir=True, is_symlink=False) for drive in self.allowed_roots],
+                total_files=0, total_directories=len(self.allowed_roots),
+            )
         target = self.validate(path)
         if not target.exists() or not target.is_dir():
             raise FileNotFoundError(f"Not a directory: {target}")
@@ -41,7 +53,10 @@ class LocalFileService:
         rows.sort(key=key, reverse=direction == "desc")
         files = sum(not entry.is_dir for entry in rows)
         dirs = sum(entry.is_dir for entry in rows)
-        parent = str(target.parent) if target != target.parent else None
+        if target in self.allowed_roots:
+            parent = self.drives_path
+        else:
+            parent = str(target.parent)
         return FileListResponse(path=str(target), parent=parent, entries=rows, total_files=files, total_directories=dirs)
 
     def _scan(self, target: Path) -> list[FileEntry]:
@@ -51,7 +66,7 @@ class LocalFileService:
                 info = item.lstat()
             except OSError:
                 continue
-            is_link = stat.S_ISLNK(info.st_mode)
+            is_link = stat.S_ISLNK(info.st_mode) or (hasattr(item, "is_junction") and item.is_junction())
             try:
                 final_info = item.stat()
                 is_dir = final_info.st_dir if hasattr(final_info, "st_dir") else stat.S_ISDIR(final_info.st_mode)
@@ -73,12 +88,16 @@ class LocalFileService:
         return entries
 
     async def mkdir(self, parent: str, name: str) -> str:
+        validate_name(name, windows=os.name == "nt")
         target = self.validate(Path(parent) / name)
         target.mkdir(parents=False, exist_ok=False)
         return str(target)
 
     async def rename(self, path: str, new_name: str) -> str:
+        validate_name(new_name, windows=os.name == "nt")
         source = self.validate(path)
+        if source in self.allowed_roots:
+            raise PermissionError("Refusing to rename the allowed local root")
         target = self.validate(source.parent / new_name)
         if target.exists():
             raise FileExistsError(target)
@@ -87,7 +106,7 @@ class LocalFileService:
 
     async def delete(self, path: str, recursive: bool = False) -> None:
         target = self.validate(path)
-        if target == self.root:
+        if target in self.allowed_roots:
             raise PermissionError("Refusing to delete the allowed local root")
         if target.is_dir():
             if not recursive and any(target.iterdir()):
@@ -98,7 +117,7 @@ class LocalFileService:
 
     def _rmtree(self, path: Path) -> None:
         for child in path.iterdir():
-            if child.is_dir() and not child.is_symlink():
+            if child.is_dir() and not child.is_symlink() and not (hasattr(child, "is_junction") and child.is_junction()):
                 self._rmtree(child)
             else:
                 child.unlink()

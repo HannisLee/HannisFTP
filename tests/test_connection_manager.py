@@ -6,7 +6,6 @@ import pytest
 from app.core.config import Settings
 from app.services.connection_manager import (
     ConnectionManager,
-    HostKeyConfirmationRequired,
     HostKeyMismatch,
     HostKeyVerificationClient,
 )
@@ -31,7 +30,7 @@ def test_host_key_verification_requires_confirmation(manager):
 
 def test_host_key_confirmation_appends_known_host(manager):
     key = asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
-    client = HostKeyVerificationClient(manager, confirm=True)
+    client = HostKeyVerificationClient(manager, confirm=True, fingerprint=key.get_fingerprint())
     assert client.validate_host_public_key("example.com", "192.0.2.10", 22, key) is True
     assert manager.known_hosts_path.exists()
     trusted = asyncssh.read_known_hosts([str(manager.known_hosts_path)]).match(
@@ -67,5 +66,15 @@ async def test_ssh_alias_config_uses_asyncssh_config_argument(monkeypatch, manag
     )
     client = HostKeyVerificationClient(manager, False)
     await manager._connect(profile, None, None, client)
-    assert captured["config"] == manager.settings.ssh_config_path
+    from pathlib import Path
+    assert captured["config"] == str(Path(manager.settings.ssh_config_path).expanduser())
+    assert "port" not in captured
     assert "config_path" not in captured
+
+
+def test_revoked_host_key_cannot_be_confirmed(manager):
+    key = asyncssh.generate_private_key("ssh-ed25519").convert_to_public()
+    manager.known_hosts_path.write_text("@revoked example.com " + key.export_public_key().decode(), encoding="ascii")
+    client = HostKeyVerificationClient(manager, True, fingerprint=key.get_fingerprint())
+    assert client.validate_host_public_key("example.com", "192.0.2.10", 22, key) is False
+    assert isinstance(client.error, HostKeyMismatch)

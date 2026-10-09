@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def utc_now() -> datetime:
@@ -44,10 +44,18 @@ class ProfileBase(BaseModel):
     username: str | None = None
     auth_method: Literal["auto", "agent", "key", "password"] = "auto"
     private_key_path: str | None = None
-    remote_root: str = "~"
+    remote_root: str = Field(default="~", min_length=1)
     connect_timeout: float = Field(default=10, ge=1, le=60)
     keepalive_interval: float = Field(default=15, ge=0, le=120)
     ssh_alias: str | None = None
+
+    @model_validator(mode="after")
+    def validate_connection(self):
+        if not self.host and not self.ssh_alias:
+            raise ValueError("A host or SSH alias is required")
+        if self.auth_method == "key" and not self.private_key_path:
+            raise ValueError("Key authentication requires a private key path")
+        return self
 
 
 class ProfileCreate(ProfileBase):
@@ -89,6 +97,8 @@ class ConnectionCreate(BaseModel):
     password: str | None = Field(default=None, exclude=True)
     private_key_passphrase: str | None = Field(default=None, exclude=True)
     confirm_host_key: bool = False
+    host_key_fingerprint: str | None = None
+    via_connection_id: str | None = None
 
 
 class ConnectionOut(BaseModel):
@@ -99,6 +109,7 @@ class ConnectionOut(BaseModel):
     username: str | None
     connected_at: datetime
     remote_root: str
+    via_connection_id: str | None = None
 
 
 class HostKeyInfo(BaseModel):
@@ -114,18 +125,31 @@ class ConnectionStatus(BaseModel):
     connection: ConnectionOut | None = None
 
 
+class RouteRequest(BaseModel):
+    source_connection_id: str
+    destination_connection_id: str
+    force: bool = False
+
+
 class TransferCreate(BaseModel):
-    direction: Literal["upload", "download"]
+    direction: Literal["upload", "download", "remote"]
     source_path: str = Field(min_length=1)
     destination_path: str = Field(min_length=1)
     connection_id: str
+    destination_connection_id: str | None = None
     conflict_strategy: Literal["ask", "skip", "overwrite", "rename", "resume"] = "ask"
+
+    @model_validator(mode="after")
+    def validate_endpoints(self):
+        if self.direction == "remote" and not self.destination_connection_id:
+            raise ValueError("Remote transfers require a destination connection")
+        return self
 
 
 class TransferOut(BaseModel):
     task_id: str
     profile_id: str
-    direction: Literal["upload", "download"]
+    direction: Literal["upload", "download", "remote"]
     source_path: str
     destination_path: str
     total_bytes: int

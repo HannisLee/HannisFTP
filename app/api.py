@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
-from typing import Literal
+import asyncio
+from pathlib import Path
 
 import asyncssh
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from app.models import (
-    ConnectionCreate, ConnectionOut, ConnectionStatus, FileListResponse, HostKeyInfo, PathRequest,
+    ConnectionCreate, ConnectionOut, ConnectionStatus, FileListResponse, PathRequest,
     ProfileCreate, ProfileOut, ProfileUpdate, RenameRequest, SSHHost, TransferCreate,
-    TransferOut,
+    TransferOut, RouteRequest,
 )
 from app.services.connection_manager import HostKeyConfirmationRequired, HostKeyMismatch
 from app.services.transfer_manager import TransferConflictError
@@ -36,6 +36,8 @@ async def config(request: Request, state: AppState = Depends(get_state)):
     return {
         "app_name": state.settings.app_name,
         "local_root": str(state.local.root),
+        "local_drives_path": state.local.drives_path,
+        "local_navigation_root": str(state.local.root) if state.settings.local_root else state.local.root.anchor,
         "token": security.token,
         "theme": state.settings.theme,
         "transfer_concurrency": state.settings.transfer_concurrency,
@@ -67,6 +69,8 @@ async def update_profile(profile_id: str, payload: ProfileUpdate, request: Reque
         return await state.storage.update_profile(profile_id, payload)
     except KeyError:
         raise HTTPException(404, "Profile not found")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
 
 
 @router.delete("/profiles/{profile_id}", status_code=204)
@@ -79,6 +83,11 @@ async def delete_profile(profile_id: str, request: Request, state: AppState = De
 @router.post("/connections", status_code=201)
 async def create_connection(payload: ConnectionCreate, request: Request, state: AppState = Depends(get_state)):
     state.security.check_http(request, modification=True)
+    if payload.via_connection_id:
+        try:
+            state.connections.get(payload.via_connection_id)
+        except KeyError:
+            return error_response(409, "Jump connection is not active")
     try:
         if payload.profile_id:
             profile = await state.storage.get_profile(payload.profile_id)
@@ -87,6 +96,8 @@ async def create_connection(payload: ConnectionCreate, request: Request, state: 
                 password=payload.password,
                 passphrase=payload.private_key_passphrase,
                 confirm_host_key=payload.confirm_host_key,
+                host_key_fingerprint=payload.host_key_fingerprint,
+                via_connection_id=payload.via_connection_id,
             )
         elif payload.ssh_alias:
             session = await state.connections.connect_ssh_alias(
@@ -94,6 +105,8 @@ async def create_connection(payload: ConnectionCreate, request: Request, state: 
                 password=payload.password,
                 passphrase=payload.private_key_passphrase,
                 confirm_host_key=payload.confirm_host_key,
+                host_key_fingerprint=payload.host_key_fingerprint,
+                via_connection_id=payload.via_connection_id,
             )
         else:
             raise HTTPException(422, "profile_id or ssh_alias is required")
@@ -105,9 +118,11 @@ async def create_connection(payload: ConnectionCreate, request: Request, state: 
         })
     except HostKeyMismatch as exc:
         return JSONResponse(status_code=400, content={"detail": str(exc), "code": "host_key_mismatch"})
-    except (OSError, asyncssh.Error, ValueError) as exc:
-        return JSONResponse(status_code=400, content={"detail": str(exc), "code": "connection_failed"})
-    await state.progress.emit(None) if False else None
+    except KeyError:
+        raise HTTPException(404, "Profile not found")
+    except (OSError, asyncssh.Error, ValueError, TimeoutError) as exc:
+        detail = str(exc) or ("SSH/SFTP connection timed out" if isinstance(exc, TimeoutError) else type(exc).__name__)
+        return JSONResponse(status_code=400, content={"detail": detail, "code": "connection_failed"})
     return session.out()
 
 
@@ -131,6 +146,16 @@ async def disconnect(connection_id: str, request: Request, state: AppState = Dep
     state.security.check_http(request, modification=True)
     await state.connections.disconnect(connection_id)
     return Response(status_code=204)
+
+
+@router.post("/connection-route")
+async def connection_route(payload: RouteRequest, request: Request, state: AppState = Depends(get_state)):
+    state.security.check_http(request, modification=True)
+    try:
+        _, route = await state.transfers.route(payload.source_connection_id, payload.destination_connection_id, payload.force)
+        return route
+    except KeyError:
+        return error_response(409, "Remote connection is not active")
 
 
 @router.get("/files/local", response_model=FileListResponse)
@@ -157,9 +182,8 @@ async def local_list(
 async def local_mkdir(payload: PathRequest, request: Request, state: AppState = Depends(get_state)):
     state.security.check_http(request, modification=True)
     try:
-        path = payload.path.rstrip("/").rstrip("\\")
-        parent, name = path.rsplit("/", 1) if "/" in path else (str(state.local.root), path)
-        result = await state.local.mkdir(parent, name)
+        path = Path(payload.path)
+        result = await state.local.mkdir(str(path.parent), path.name)
         return {"path": result}
     except (FileExistsError, FileNotFoundError, PermissionError, ValueError) as exc:
         return error_response(400, str(exc))
@@ -205,6 +229,8 @@ async def remote_list(
         return error_response(409, "Remote connection is not active")
     except asyncssh.SFTPError as exc:
         return error_response(400, f"SFTP error: {exc.reason or exc}")
+    except (ValueError, OSError) as exc:
+        return error_response(400, str(exc))
 
 
 @router.post("/files/remote/mkdir", status_code=201)
@@ -220,6 +246,8 @@ async def remote_mkdir(payload: PathRequest, request: Request, connection_id: st
         return error_response(409, "Remote connection is not active")
     except asyncssh.SFTPError as exc:
         return error_response(400, f"SFTP error: {exc.reason or exc}")
+    except (ValueError, OSError) as exc:
+        return error_response(400, str(exc))
 
 
 @router.post("/files/remote/rename")
@@ -233,6 +261,8 @@ async def remote_rename(payload: RenameRequest, request: Request, connection_id:
         return error_response(409, "Remote connection is not active")
     except asyncssh.SFTPError as exc:
         return error_response(400, f"SFTP error: {exc.reason or exc}")
+    except (ValueError, OSError) as exc:
+        return error_response(400, str(exc))
 
 
 @router.delete("/files/remote")
@@ -246,6 +276,8 @@ async def remote_delete(request: Request, connection_id: str, path: str, recursi
         return error_response(409, "Remote connection is not active")
     except asyncssh.SFTPError as exc:
         return error_response(400, f"SFTP error: {exc.reason or exc}")
+    except (ValueError, OSError) as exc:
+        return error_response(400, str(exc))
 
 
 @router.post("/transfers", response_model=TransferOut, status_code=202)
@@ -328,5 +360,24 @@ async def websocket_events(websocket: WebSocket) -> None:
     if not await websocket.app.state.state.security.check_websocket(websocket):
         return
     await websocket.accept()
-    async for message in websocket.app.state.state.progress.subscribe():
-        await websocket.send_text(message.model_dump_json())
+    async def send_events():
+        async for message in websocket.app.state.state.progress.subscribe():
+            await websocket.send_text(message.model_dump_json())
+
+    async def receive_disconnect():
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+
+    tasks = [asyncio.create_task(send_events()), asyncio.create_task(receive_disconnect())]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

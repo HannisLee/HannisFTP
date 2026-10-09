@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ import asyncssh
 from app.core.config import Settings
 from app.models import EventMessage, TransferOut
 from app.services.progress_manager import ProgressManager
+from app.services.path_safety import local_path, remote_kind
 
 
 class TransferControl:
@@ -47,6 +49,7 @@ class StatInfo(Protocol):
     size: int
     mtime: float
     is_dir: bool
+    is_symlink: bool
 
 
 class TransferIO(ABC):
@@ -71,56 +74,65 @@ class TransferIO(ABC):
     @abstractmethod
     async def unique_path(self, path: str) -> str: ...
 
+    async def replace(self, source: str, target: str) -> None:
+        raise NotImplementedError("Atomic replacement is not supported")
+
 
 class AsyncSFTPTransferIO(TransferIO):
-    def __init__(self, sftp: asyncssh.SFTPClient) -> None:
+    def __init__(self, sftp: asyncssh.SFTPClient, service=None) -> None:
         self.sftp = sftp
+        self.service = service
+
+    async def _validate(self, path: str, *, missing: bool = False) -> str:
+        if self.service:
+            return await self.service.checked_path(path, allow_missing=missing)
+        return path
 
     async def stat(self, path: str) -> StatInfo:
-        attrs = await self.sftp.stat(path)
+        attrs = await self.sftp.stat(await self._validate(path))
         return type("Stat", (), {
             "size": int(getattr(attrs, "size", 0) or 0),
             "mtime": float(getattr(attrs, "mtime", 0) or 0),
-            "is_dir": bool(attrs.is_dir()),
+            "is_dir": remote_kind(attrs)[0],
+            "is_symlink": remote_kind(attrs)[1],
         })()
 
     async def exists(self, path: str) -> bool:
         try:
             await self.stat(path)
             return True
-        except asyncssh.SFTPNoSuchPath:
-            return False
-        except asyncssh.SFTPError:
+        except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath):
             return False
 
     async def listdir(self, path: str) -> list[str]:
-        entries = await self.sftp.readdir(path)
+        entries = await self.sftp.readdir(await self._validate(path))
         return [item.filename for item in entries if item.filename not in {".", ".."}]
 
     async def lstat(self, path: str) -> StatInfo:
-        attrs = await self.sftp.stat(path)
+        attrs = await self.sftp.lstat(await self._validate(path))
         return type("Stat", (), {
             "size": int(getattr(attrs, "size", 0) or 0),
             "mtime": float(getattr(attrs, "mtime", 0) or 0),
-            "is_dir": bool(attrs.is_dir()),
+            "is_dir": remote_kind(attrs)[0],
+            "is_symlink": remote_kind(attrs)[1],
         })()
 
     async def mkdir(self, path: str) -> None:
         try:
-            await self.sftp.mkdir(path)
-        except asyncssh.SFTPFailure:
+            await self.sftp.mkdir(await self._validate(path, missing=True))
+        except (asyncssh.SFTPFailure, asyncssh.SFTPFileAlreadyExists):
             # Some servers return SSH_FX_FAILURE for an existing directory.
-            if not await self.exists(path):
+            if not await self.exists(path) or not (await self.stat(path)).is_dir:
                 raise
 
     async def open_read(self, path: str) -> Any:
-        return await self.sftp.open(path, pflags=asyncssh.FXF_READ)
+        return await self.sftp.open(await self._validate(path), "rb")
 
     async def open_write(self, path: str, *, resume: bool) -> Any:
         flags = asyncssh.FXF_WRITE | asyncssh.FXF_CREAT
         if not resume:
             flags |= asyncssh.FXF_TRUNC
-        return await self.sftp.open(path, pflags=flags)
+        return await self.sftp.open(await self._validate(path, missing=True), flags, encoding=None)
 
     async def remove(self, path: str) -> None:
         info = await self.stat(path)
@@ -130,7 +142,10 @@ class AsyncSFTPTransferIO(TransferIO):
             await self.sftp.remove(path)
 
     async def rename(self, source: str, target: str) -> None:
-        await self.sftp.rename(source, target)
+        await self.sftp.rename(await self._validate(source), await self._validate(target, missing=True))
+
+    async def replace(self, source: str, target: str) -> None:
+        await self.sftp.posix_rename(await self._validate(source), await self._validate(target, missing=True))
 
     async def unique_path(self, path: str) -> str:
         base, ext = os.path.splitext(path)
@@ -141,58 +156,71 @@ class AsyncSFTPTransferIO(TransferIO):
 
 
 class LocalTransferIO(TransferIO):
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path | tuple[Path, ...]) -> None:
         self.root = root
 
+    def _validate(self, path: str) -> Path:
+        return local_path(self.root, path)
+
     async def stat(self, path: str) -> StatInfo:
-        info = Path(path).stat()
+        target = self._validate(path)
+        info = target.stat()
         return type("Stat", (), {
             "size": info.st_size,
             "mtime": info.st_mtime,
-            "is_dir": Path(path).is_dir(),
+            "is_dir": stat.S_ISDIR(info.st_mode),
+            "is_symlink": False,
         })()
 
     async def exists(self, path: str) -> bool:
-        return Path(path).exists()
+        return self._validate(path).exists()
 
     async def mkdir(self, path: str) -> None:
-        Path(path).mkdir(parents=True, exist_ok=True)
+        self._validate(path).mkdir(parents=True, exist_ok=True)
 
     async def listdir(self, path: str) -> list[str]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, os.listdir, path)
+        return await loop.run_in_executor(None, os.listdir, self._validate(path))
 
     async def lstat(self, path: str) -> StatInfo:
-        info = Path(path).lstat()
-        final = Path(path).stat()
+        info = self._validate(path).lstat()
         return type("Stat", (), {
-            "size": final.st_size,
-            "mtime": final.st_mtime,
-            "is_dir": Path(path).is_dir(),
+            "size": info.st_size,
+            "mtime": info.st_mtime,
+            "is_dir": stat.S_ISDIR(info.st_mode),
+            "is_symlink": stat.S_ISLNK(info.st_mode),
         })()
 
     async def open_read(self, path: str) -> Any:
-        return await aiofiles.open(path, "rb")
+        return await aiofiles.open(self._validate(path), "rb")
 
     async def open_write(self, path: str, *, resume: bool) -> Any:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        return await aiofiles.open(path, "rb+" if resume else "wb+")
+        target = self._validate(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return await aiofiles.open(target, "rb+" if resume else "wb+")
 
     async def remove(self, path: str) -> None:
-        target = Path(path)
+        target = self._validate(path)
         if target.is_dir():
             target.rmdir()
         else:
             target.unlink()
 
     async def rename(self, source: str, target: str) -> None:
-        os.rename(source, target)
+        source_path, target_path = self._validate(source), self._validate(target)
+        if target_path.exists():
+            raise FileExistsError(target_path)
+        os.rename(source_path, target_path)
+
+    async def replace(self, source: str, target: str) -> None:
+        os.replace(self._validate(source), self._validate(target))
 
     async def unique_path(self, path: str) -> str:
-        candidate = Path(path)
+        original = self._validate(path)
+        candidate = original
         counter = 1
         while candidate.exists():
-            candidate = candidate.with_name(f"{candidate.stem} ({counter}){candidate.suffix}")
+            candidate = original.with_name(f"{original.stem} ({counter}){original.suffix}")
             counter += 1
         return str(candidate)
 
@@ -213,12 +241,14 @@ class TransferWorker:
         source_io: TransferIO,
         destination_io: TransferIO,
         persist,
+        direct_copy=None,
     ) -> None:
         self.settings = settings
         self.progress = progress
         self.source_io = source_io
         self.destination_io = destination_io
         self.persist = persist
+        self.direct_copy = direct_copy
 
     async def run(self, task: MutableTask) -> TransferOut:
         model = task.model
@@ -245,6 +275,8 @@ class TransferWorker:
             model.current_speed = 0
             model.eta_seconds = None
             model.error_message = str(exc) or "Cancelled"
+            from app.models import utc_now
+            model.finished_at = utc_now()
             await self._cleanup_part(task)
             await self.persist(model)
             await self.progress.emit(EventMessage(event_type="transfer_cancelled", task_id=model.task_id, payload=model.model_dump(mode="json")), force=True)
@@ -264,7 +296,8 @@ class TransferWorker:
         model.current_speed = 0
         model.eta_seconds = 0
         model.current_file = None
-        model.resume_metadata = {}
+        model.resume_metadata = {key: value for key, value in model.resume_metadata.items()
+                                 if key in {"endpoints", "route", "route_detail"}}
         await self.persist(model)
         await self.progress.emit(EventMessage(event_type="transfer_completed", task_id=model.task_id, payload=model.model_dump(mode="json")), force=True)
         return model
@@ -272,13 +305,16 @@ class TransferWorker:
     async def _run_entries(self, task: MutableTask) -> None:
         model = task.model
         completed_before = int(model.resume_metadata.get("completed_entries", 0))
-        if completed_before > len(task.entries):
+        if not 0 <= completed_before <= len(task.entries):
             raise ValueError("Resume metadata is inconsistent with the file manifest")
+        model.transferred_bytes = sum(entry.size for entry in task.entries[:completed_before])
         for index, entry in enumerate(task.entries):
             if index < completed_before:
                 continue
             if task.control.cancel.is_set():
                 raise TransferCancelled()
+            if task.control.pause.is_set():
+                raise TransferPaused()
             target = self._destination_for(model, entry)
             if entry.is_symlink:
                 raise ValueError(f"Symbolic links are not transferred: {entry.relative_path}")
@@ -299,7 +335,7 @@ class TransferWorker:
         model = task.model
         source_path = self._source_for(model, entry)
         source_stat = await self.source_io.stat(source_path)
-        if source_stat.size != entry.size or abs(source_stat.mtime - entry.mtime) > 2:
+        if source_stat.size != entry.size or source_stat.mtime != entry.mtime:
             raise ValueError(
                 f"Source changed since the transfer was created: {entry.relative_path} "
                 f"(expected {entry.size} bytes, got {source_stat.size})"
@@ -313,7 +349,7 @@ class TransferWorker:
 
         part = self._part_path(model, target, index)
         task.current_part = part
-        resume_requested = model.conflict_strategy == "resume"
+        resume_requested = model.conflict_strategy == "resume" or model.resume_metadata.get("resuming") or "offset" in model.resume_metadata
         part_exists = await self.destination_io.exists(part)
         offset = 0
         if resume_requested and part_exists:
@@ -328,13 +364,41 @@ class TransferWorker:
         if target != source_path and await self.destination_io.exists(target) and model.conflict_strategy == "rename":
             target = await self.destination_io.unique_path(target)
 
-        read_handle = await self.source_io.open_read(source_path)
-        write_handle = await self.destination_io.open_write(part, resume=offset > 0)
-        transferred_at_start = max(model.transferred_bytes - offset, 0)
+        read_handle = None
+        write_handle = None
+        transferred_at_start = model.transferred_bytes
         started = time.monotonic()
         bytes_this_file = offset
+        initial_offset = offset
         ema = model.current_speed
         try:
+            if self.direct_copy:
+                async def report(copied):
+                    nonlocal ema
+                    model.transferred_bytes = transferred_at_start + copied
+                    elapsed = max(time.monotonic() - started, 1e-6)
+                    speed = max(copied - initial_offset, 0) / elapsed
+                    ema = speed if not ema else .25 * speed + .75 * ema
+                    model.current_speed = ema
+                    model.average_speed = speed
+                    model.eta_seconds = max(model.total_bytes - model.transferred_bytes, 0) / ema if ema else None
+                    await self.progress.emit(EventMessage(event_type="transfer_progress", task_id=model.task_id,
+                                                         payload=model.model_dump(mode="json")))
+                await self.direct_copy(task, source_path, part, offset, source_stat.size, report)
+                # A failed direct attempt may have written a prefix. The relay
+                # continues the same task part, never the existing target file.
+                offset = (await self.destination_io.stat(part)).size if await self.destination_io.exists(part) else 0
+                if offset > source_stat.size:
+                    offset = 0
+                bytes_this_file = offset
+                model.transferred_bytes = transferred_at_start + offset
+                if task.control.cancel.is_set():
+                    raise TransferCancelled()
+                if task.control.pause.is_set():
+                    model.resume_metadata.update(completed_entries=index, offset=offset)
+                    raise TransferPaused()
+            read_handle = await self.source_io.open_read(source_path)
+            write_handle = await self.destination_io.open_write(part, resume=offset > 0)
             while offset < source_stat.size:
                 if task.control.cancel.is_set():
                     raise TransferCancelled()
@@ -358,11 +422,10 @@ class TransferWorker:
                 bytes_this_file += len(chunk)
                 model.transferred_bytes = transferred_at_start + bytes_this_file
                 elapsed = max(time.monotonic() - started, 1e-6)
-                instant = bytes_this_file / elapsed
+                instant = (bytes_this_file - initial_offset) / elapsed
                 ema = instant if ema == 0 else 0.25 * instant + 0.75 * ema
                 model.current_speed = ema
-                total_elapsed = max((time.monotonic() - started) / max(bytes_this_file, 1), 1e-9)
-                model.average_speed = (model.transferred_bytes or 1) / max(elapsed, 1e-6)
+                model.average_speed = instant
                 remaining = max(model.total_bytes - model.transferred_bytes, 0)
                 model.eta_seconds = remaining / ema if ema > 0 else None
                 await self.progress.emit(EventMessage(
@@ -374,9 +437,15 @@ class TransferWorker:
                 result = flush()
                 if asyncio.iscoroutine(result):
                     await result
+            # Close buffered local handles before checking the on-disk size.
+            await write_handle.close()
+            write_handle = None
             final_stat = await self.destination_io.stat(part)
             if final_stat.size != source_stat.size:
                 raise IOError("Final size verification failed")
+            final_source = await self.source_io.stat(source_path)
+            if final_source.size != source_stat.size or final_source.mtime != source_stat.mtime:
+                raise ValueError("Source changed during the transfer")
         finally:
             for handle in (read_handle, write_handle):
                 close = getattr(handle, "close", None)
@@ -434,12 +503,13 @@ class TransferWorker:
                 await self.destination_io.remove(part)
                 return
             if model.conflict_strategy == "overwrite":
-                try:
-                    await self.destination_io.rename(part, target)
-                except Exception:
-                    await self.destination_io.remove(target)
-                    await self.destination_io.rename(part, target)
+                await self.destination_io.replace(part, target)
                 return
+            if model.conflict_strategy == "resume":
+                await self.destination_io.replace(part, target)
+                return
+            if model.conflict_strategy == "ask":
+                raise FileExistsError(f"Target already exists: {target}")
             target = await self.destination_io.unique_path(target)
         await self.destination_io.rename(part, target)
 
@@ -456,12 +526,16 @@ class TransferWorker:
     @staticmethod
     def _destination_for(model: TransferOut, entry: TransferEntry) -> str:
         import posixpath
-        if model.direction == "upload":
+        if not entry.relative_path:
+            return model.destination_path
+        if model.direction in {"upload", "remote"}:
             return posixpath.join(model.destination_path, entry.relative_path)
         return str(Path(model.destination_path) / entry.relative_path)
 
     @staticmethod
     def _source_for(model: TransferOut, entry: TransferEntry) -> str:
+        if not entry.relative_path:
+            return model.source_path
         if model.direction == "upload":
             return str(Path(model.source_path) / entry.relative_path)
         import posixpath
@@ -469,7 +543,7 @@ class TransferWorker:
 
     @staticmethod
     def _part_path(model: TransferOut, target: str, index: int) -> str:
-        if model.direction == "upload":
+        if model.direction in {"upload", "remote"}:
             import posixpath
             directory = posixpath.dirname(target)
             return posixpath.join(directory, f".{model.task_id}.{index}.part")
